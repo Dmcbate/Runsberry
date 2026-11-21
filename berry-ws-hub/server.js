@@ -1,9 +1,24 @@
 const http = require('http');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+const webpush = require('web-push');
 
 const PORT = process.env.PORT || 8080;
 const SECRET = process.env.BERRY_WS_SECRET || 'CHANGE_THIS_TO_A_LONG_RANDOM_SECRET';
+const PUSH_SECRET = process.env.PUSH_SECRET || '';
+const VAPID_SUBJECT = (process.env.VAPID_SUBJECT || 'mailto:dmc007bate@gmail.com').trim();
+const VAPID_PUBLIC = (process.env.VAPID_PUBLIC || '').trim();
+const VAPID_PRIVATE = (process.env.VAPID_PRIVATE || '').trim();
+
+let VAPID_READY = false;
+if (VAPID_PUBLIC && VAPID_PRIVATE) {
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
+    VAPID_READY = true;
+  } catch (err) {
+    console.error('VAPID init failed:', err.message);
+  }
+}
 
 // 1-on-1 Messenger clients: Map<userId, Set<WebSocket>>
 const clients = new Map();
@@ -72,26 +87,76 @@ function broadcastPresence(uid, isOnline) {
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, onlineUsers: clients.size, activeRooms: rooms.size }));
+    return res.end(JSON.stringify({
+      ok: true,
+      onlineUsers: clients.size,
+      activeRooms: rooms.size,
+      vapidReady: VAPID_READY
+    }));
   }
 
+  // Status check for Web Push (open in browser to verify)
+  if (req.method === 'GET' && req.url === '/push') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      ok: true,
+      vapidReady: VAPID_READY,
+      secretSet: Boolean(PUSH_SECRET)
+    }));
+  }
+
+  // Unified /push endpoint: handles both WebSocket relay & Background Web Push
   if (req.method === 'POST' && req.url === '/push') {
-    if (req.headers['x-berry-secret'] !== SECRET) {
-      res.writeHead(403);
-      return res.end('Forbidden');
-    }
     let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 1048576) req.destroy();
+    });
+    req.on('end', async () => {
+      // 1. Existing WebSocket Hub Relay (uses x-berry-secret header)
+      if (req.headers['x-berry-secret']) {
+        if (req.headers['x-berry-secret'] !== SECRET) {
+          res.writeHead(403);
+          return res.end('Forbidden');
+        }
+        try {
+          const data = JSON.parse(body || '{}');
+          if (data.to) sendToUser(data.to, data.payload);
+          if (data.room_id) broadcastToRoom(data.room_id, data.payload);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          res.writeHead(400);
+          return res.end('Bad JSON');
+        }
+      }
+
+      // 2. Background Web Push Relay (Android, Desktop & iOS 16.4+ PWA)
       try {
-        const data = JSON.parse(body);
-        if (data.to) sendToUser(data.to, data.payload);
-        if (data.room_id) broadcastToRoom(data.room_id, data.payload);
+        const data = JSON.parse(body || '{}');
+        if (!VAPID_READY) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'VAPID keys not configured' }));
+        }
+        if (!PUSH_SECRET || data.secret !== PUSH_SECRET) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'Forbidden' }));
+        }
+
+        const payload = JSON.stringify(data.notification || {});
+        const opts = { TTL: 60, urgency: data.urgency || 'high' };
+        const subs = Array.isArray(data.subscriptions) ? data.subscriptions : [];
+
+        const results = await Promise.allSettled(
+          subs.map((sub) => webpush.sendNotification(sub, payload, opts))
+        );
+        const sent = results.filter((r) => r.status === 'fulfilled').length;
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
+        return res.end(JSON.stringify({ ok: true, sent, total: subs.length }));
       } catch (e) {
-        res.writeHead(400);
-        res.end('Bad JSON');
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Bad JSON' }));
       }
     });
     return;
@@ -206,5 +271,5 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Berry WebSocket Hub running on port ${PORT}`);
+  console.log(`Berry WebSocket Hub running on port ${PORT} (WebPush: ${VAPID_READY})`);
 });
