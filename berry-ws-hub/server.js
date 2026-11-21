@@ -5,8 +5,10 @@ const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 8080;
 const SECRET = process.env.BERRY_WS_SECRET || 'CHANGE_THIS_TO_A_LONG_RANDOM_SECRET';
 
-// Map<userId, Set<WebSocket>> — supports multiple tabs/devices per user
+// 1-on-1 Messenger clients: Map<userId, Set<WebSocket>>
 const clients = new Map();
+// Chatroom & Group subscribers: Map<roomId, Set<WebSocket>>
+const rooms = new Map();
 
 function verifyToken(token) {
   if (!token || typeof token !== 'string') return null;
@@ -18,7 +20,6 @@ function verifyToken(token) {
   const ts = parseInt(tsStr, 10);
   if (!uid || !ts) return null;
 
-  // Token valid for 24 hours
   if (Math.abs(Math.floor(Date.now() / 1000) - ts) > 86400) return null;
 
   const expected = crypto
@@ -46,6 +47,17 @@ function sendToUser(targetUserId, payloadObj) {
   return delivered;
 }
 
+function broadcastToRoom(roomId, payloadObj, excludeWs = null) {
+  const roomSet = rooms.get(Number(roomId));
+  if (!roomSet || roomSet.size === 0) return;
+  const data = JSON.stringify(payloadObj);
+  for (const ws of roomSet) {
+    if (ws !== excludeWs && ws.readyState === 1) {
+      ws.send(data);
+    }
+  }
+}
+
 function broadcastPresence(uid, isOnline) {
   const payload = JSON.stringify({ type: 'presence', user_id: uid, online: isOnline });
   for (const [, sockets] of clients) {
@@ -57,14 +69,12 @@ function broadcastPresence(uid, isOnline) {
   }
 }
 
-// HTTP server: handles health checks + optional server-to-server pushes from WordPress PHP
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, onlineUsers: clients.size }));
+    return res.end(JSON.stringify({ ok: true, onlineUsers: clients.size, activeRooms: rooms.size }));
   }
 
-  // Optional: WordPress PHP can POST to /push to trigger instant UI updates (e.g., paid video status, call accept)
   if (req.method === 'POST' && req.url === '/push') {
     if (req.headers['x-berry-secret'] !== SECRET) {
       res.writeHead(403);
@@ -76,6 +86,7 @@ const server = http.createServer((req, res) => {
       try {
         const data = JSON.parse(body);
         if (data.to) sendToUser(data.to, data.payload);
+        if (data.room_id) broadcastToRoom(data.room_id, data.payload);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       } catch (e) {
@@ -96,6 +107,7 @@ wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const token = url.searchParams.get('token');
   const partnerParam = parseInt(url.searchParams.get('partner_id') || '0', 10);
+  const roomParam = parseInt(url.searchParams.get('room_id') || '0', 10);
 
   const userId = verifyToken(token);
   if (!userId) {
@@ -105,6 +117,7 @@ wss.on('connection', (ws, req) => {
 
   ws.userId = userId;
   ws.watchingPartnerId = partnerParam || 0;
+  ws.roomId = roomParam || 0;
   ws.isAlive = true;
 
   if (!clients.has(userId)) clients.set(userId, new Set());
@@ -113,10 +126,15 @@ wss.on('connection', (ws, req) => {
 
   if (wasOffline) broadcastPresence(userId, true);
 
-  // Immediately tell this client if their current chat partner is online
   if (ws.watchingPartnerId) {
     const partnerOnline = clients.has(ws.watchingPartnerId) && clients.get(ws.watchingPartnerId).size > 0;
     ws.send(JSON.stringify({ type: 'presence', user_id: ws.watchingPartnerId, online: partnerOnline }));
+  }
+
+  // Subscribe to Chatroom / Group channel if room_id is provided
+  if (ws.roomId > 0) {
+    if (!rooms.has(ws.roomId)) rooms.set(ws.roomId, new Set());
+    rooms.get(ws.roomId).add(ws);
   }
 
   ws.on('pong', () => { ws.isAlive = true; });
@@ -125,21 +143,28 @@ wss.on('connection', (ws, req) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
 
-    // Keep-alive ping from browser (prevents Bunny CDN idle timeout)
     if (msg.type === 'ping') {
       ws.isAlive = true;
       ws.send(JSON.stringify({ type: 'pong' }));
       return;
     }
 
+    // Chatroom & Group Broadcast Events
+    if (['room_post', 'room_edit', 'room_delete', 'room_react', 'room_pin', 'room_update'].includes(msg.type)) {
+      const rid = parseInt(msg.room_id || ws.roomId || '0', 10);
+      if (rid > 0) {
+        broadcastToRoom(rid, { ...msg, from: userId }, ws);
+      }
+      return;
+    }
+
+    // 1-on-1 Messenger & Private Chat Request Events
     const to = parseInt(msg.to || '0', 10);
     if (!to) return;
 
-    // Route real-time events directly to target user
-    if (['new_msg', 'typing', 'read', 'unsend', 'card_update', 'rtc_signal', 'incoming_call', 'call_accepted', 'call_ended'].includes(msg.type)) {
+    if (['new_msg', 'typing', 'read', 'unsend', 'card_update', 'rtc_signal', 'incoming_call', 'call_accepted', 'call_ended', 'chat_request'].includes(msg.type)) {
       sendToUser(to, { ...msg, from: userId });
 
-      // Sync across sender's own other open tabs for messages/unsends
       if (msg.type === 'new_msg' || msg.type === 'unsend') {
         const mySockets = clients.get(userId);
         if (mySockets) {
@@ -162,10 +187,14 @@ wss.on('connection', (ws, req) => {
         broadcastPresence(userId, false);
       }
     }
+    if (ws.roomId > 0 && rooms.has(ws.roomId)) {
+      const rSet = rooms.get(ws.roomId);
+      rSet.delete(ws);
+      if (rSet.size === 0) rooms.delete(ws.roomId);
+    }
   });
 });
 
-// Clean up dead sockets every 30s
 setInterval(() => {
   for (const [, sockets] of clients) {
     for (const ws of sockets) {
